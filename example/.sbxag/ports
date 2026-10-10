@@ -1,4 +1,5 @@
-# Forwarded to localhost on the host. "3000" or "host:guest".
+# Forwarded to localhost on the host. "3000" or "host:guest". `sbxag --host` to expose on your network.
+# Ports are fixed when the sandbox is created: after editing this file, run `sbxag destroy` and start again.
 54321   # Supabase API
 54322   # Postgres
 54323   # Studio

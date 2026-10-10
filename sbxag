@@ -10,6 +10,8 @@
 #   setup.sh  runs as root INSIDE the VM on first run — install the project's toolchain there.
 #             If it installs Docker (dockerd), Docker is started automatically on every launch.
 #   ports     one port per line ("3000", or "8080:80" for host:guest), forwarded to localhost.
+#             Use --host to make them reachable from other machines. Ports are fixed when the
+#             sandbox is created: after changing them, run `sbxag destroy` and start again.
 #
 # Run `sbxag -h` for usage.
 set -euo pipefail
@@ -69,6 +71,18 @@ fi
 '
 
 exists()  { msb ls -q | grep -qx "$NAME"; }
+# Distinct host addresses the existing sandbox's ports are bound to (fixed at creation).
+bound_ips() {
+  msb inspect "$NAME" --format json 2>/dev/null \
+    | grep -oE '"host_bind" *: *"[^"]*"' | sed -E 's/.*"([^"]*)"$/\1/' | sort -u
+}
+is_loopback() { [[ "$1" == 127.* ]]; }
+valid_ipv4() {
+  local IFS=. o; local -a parts
+  [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  read -ra parts <<< "$1"
+  for o in "${parts[@]}"; do (( 10#$o <= 255 )) || return 1; done
+}
 running() { msb ls -q --running | grep -qx "$NAME"; }
 
 create() {
@@ -80,7 +94,7 @@ create() {
       [ -z "$p" ] && continue
       [[ "$p" =~ ^[0-9]+(:[0-9]+)?$ ]] || { echo "Invalid line in .sbxag/ports: $p" >&2; exit 1; }
       [[ "$p" == *:* ]] || p="$p:$p"
-      port_flags+=(-p "$p")
+      port_flags+=(-p "$HOST_BIND:$p")
     done < "$CFG/ports"
   fi
 
@@ -99,11 +113,30 @@ create() {
     -e DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
     ${port_flags[@]+"${port_flags[@]}"} \
     debian:trixie-slim
+
+  if [ ${#port_flags[@]} -gt 0 ] && ! is_loopback "$HOST_BIND"; then
+    echo "Warning: ports are bound to $HOST_BIND and reachable from other machines on your network:" \
+      "$(printf '%s ' "${port_flags[@]}" | sed 's/-p //g')" >&2
+  fi
 }
 
 # Bring the sandbox to a usable state: create or start it, provision once, start services.
 up() {
-  if ! exists; then create; elif ! running; then msb start "$NAME"; fi
+  if ! exists; then
+    create
+  else
+    local ips ip exposed=
+    ips="$(bound_ips)"
+    for ip in $ips; do is_loopback "$ip" || exposed+="$ip "; done
+    if [ -n "$HOST_SET" ] && [ -n "$ips" ] && [ "$ips" != "$HOST_BIND" ]; then
+      echo "Note: $NAME already exists with ports bound to $(echo $ips); --host only applies at creation." \
+        "Run 'sbxag destroy' to re-create it bound to $HOST_BIND." >&2
+    elif [ -z "$HOST_SET" ] && [ -n "$exposed" ]; then
+      echo "Note: $NAME's ports are bound to ${exposed% } and reachable from your network." \
+        "To restrict them to localhost: sbxag destroy, then sbxag." >&2
+    fi
+    running || msb start "$NAME"
+  fi
   if ! msb exec --no-stdin -q "$NAME" -- test -f /opt/.provisioned; then
     echo "First run: installing agents and project tools (a few minutes)..."
     msb exec --no-stdin "$NAME" -- bash -c "$PROVISION"
@@ -116,6 +149,7 @@ usage() {
 sbxag — one microsandbox microVM per project, with AI coding agents inside.
 
 Usage (from the project root):
+  sbxag [--host [IP]] [COMMAND]
   sbxag                 open a shell in the project's sandbox
   sbxag agy [ARGS]      run Antigravity CLI
   sbxag claude [ARGS]   run Claude Code
@@ -125,9 +159,15 @@ Usage (from the project root):
   sbxag update          update sbxag itself to the latest version
   sbxag -h, --help      show this help
 
+Options:
+  --host [IP]           bind forwarded ports to IP instead of 127.0.0.1, like vite's --host;
+                        without IP, 0.0.0.0 (reachable from other machines on your network).
+                        Applies when the sandbox is created.
+
 Per-project config (optional), in .sbxag/:
   setup.sh   runs as root in the VM on first run; install the toolchain here
-  ports      one port per line ("3000" or "8080:80"), forwarded to localhost
+  ports      one port per line ("3000" or "8080:80"), forwarded to localhost (see --host).
+             Fixed at creation: after editing, run `sbxag destroy` and start again.
 
 Agent logins live in shared volumes (sbxag-claude, sbxag-keyring): sign in once per agent,
 every project's sandbox uses it. Reset with: msb volume rm sbxag-claude sbxag-keyring
@@ -153,7 +193,24 @@ self_update() {
   echo "Updated $self"
 }
 
+# Leading options (anything after the command is passed through to the agent).
+HOST_BIND=127.0.0.1 HOST_SET=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --host=*) HOST_BIND="${1#--host=}"; HOST_SET=1; shift ;;
+    --host)
+      HOST_SET=1; shift
+      if [[ "${1:-}" =~ ^[0-9.]+$ ]]; then HOST_BIND="$1"; shift; else HOST_BIND=0.0.0.0; fi ;;
+    *) break ;;
+  esac
+done
+valid_ipv4 "$HOST_BIND" || { echo "--host: not a valid IPv4 address: $HOST_BIND" >&2; exit 1; }
+
 cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  stop|destroy|update)
+    [ -n "$HOST_SET" ] && { echo "--host has no effect with '$cmd'; it applies when a sandbox is created." >&2; exit 1; } ;;
+esac
 case "$cmd" in
   -h|--help) usage; exit 0 ;;
   update) self_update; exit 0 ;;
