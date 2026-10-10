@@ -1,4 +1,4 @@
-# Runs as root inside the sandbox on first boot (Debian 13). Re-run with: agy-sandbox setup
+# Runs as root inside the sandbox on first boot (Debian 13). Re-run with: sbxag setup
 # Example: Bun + Supabase CLI (local stack needs Docker).
 
 # Docker — installing it is enough; the launcher starts dockerd on every boot.

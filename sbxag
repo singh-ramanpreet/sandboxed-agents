@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# sbxag — one microsandbox microVM per project, with AI coding agents inside.
+#
+# The project's dev environment (Docker, databases, toolchains) is built once per project.
+# Agents (agy, claude) are lightweight and all live in the same VM, so switching agents
+# never duplicates the environment. Agent logins are kept in named volumes shared by all
+# project sandboxes: sign in once per agent, use it everywhere.
+#
+# Per project (optional), in <project>/.sbxag/:
+#   setup.sh  runs as root INSIDE the VM on first run — install the project's toolchain there.
+#             If it installs Docker (dockerd), Docker is started automatically on every launch.
+#   ports     one port per line ("3000", or "8080:80" for host:guest), forwarded to localhost.
+#
+# Run `sbxag -h` for usage.
+set -euo pipefail
+
+NAME="${NAME:-sbxag-$(basename "$PWD")}"
+CFG="$PWD/.sbxag"
+
+# Shared, cross-project volumes holding agent logins.
+VOL_CLAUDE="${VOL_CLAUDE:-sbxag-claude}"       # Claude Code config + credentials (CLAUDE_CONFIG_DIR)
+VOL_KEYRING="${VOL_KEYRING:-sbxag-keyring}"    # gnome-keyring files, where agy keeps its Google login
+KEYRING_DIR=/root/.local/share/keyrings
+
+# Provisioning: runs once per project sandbox, the first time it is created.
+PROVISION='
+set -e
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates curl git unzip bash procps openssl \
+  dbus dbus-x11 gnome-keyring
+echo "=== installing Antigravity CLI (agy) ==="
+curl -fsSL https://antigravity.google/cli/install.sh | bash
+echo "=== installing Claude Code ==="
+curl -fsSL https://claude.ai/install.sh | bash
+if [ -f /workspace/.sbxag/setup.sh ]; then
+  echo "=== running /workspace/.sbxag/setup.sh ==="
+  bash -e /workspace/.sbxag/setup.sh
+fi
+touch /opt/.provisioned
+'
+
+# Services: run on every launch (microsandbox does not re-run anything when a stopped sandbox
+# starts again). Idempotent: only starts what is not already running. Daemons are detached
+# with setsid so they outlive this exec.
+SERVICES='
+set -e
+mkdir -p /run/user/0 && chmod 700 /run/user/0
+names() { dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply \
+            / org.freedesktop.DBus.ListNames 2>/dev/null; }
+# D-Bus session + unlocked keyring (agy stores its login there). The keyring lives on a volume
+# shared by all project sandboxes, so its password is kept next to it, in that same volume.
+if ! names >/dev/null; then
+  rm -f /run/user/0/bus
+  dbus-daemon --session --address="$DBUS_SESSION_BUS_ADDRESS" --fork --nopidfile
+fi
+if ! names | grep -q org.freedesktop.secrets; then
+  pw="$KEYRING_DIR/.sbxag-password"
+  [ -s "$pw" ] || { (umask 077; openssl rand -hex 16 > "$pw"); }
+  gnome-keyring-daemon --daemonize --unlock --components=secrets < "$pw" >/dev/null
+fi
+# Docker, only if the project setup installed it.
+if command -v dockerd >/dev/null 2>&1 && ! docker info >/dev/null 2>&1; then
+  # /run survives a stop/start here, so clear pid files and sockets left by the previous boot.
+  rm -f /var/run/docker.pid /var/run/docker.sock /var/run/docker/containerd/containerd.pid
+  setsid -f dockerd >/var/log/dockerd.log 2>&1 </dev/null
+  timeout 180 sh -c "until docker info >/dev/null 2>&1; do sleep 1; done" \
+    || { tail -50 /var/log/dockerd.log; docker info; exit 1; }
+fi
+'
+
+exists()  { msb ls -q | grep -qx "$NAME"; }
+running() { msb ls -q --running | grep -qx "$NAME"; }
+
+create() {
+  # Ports come from a plain list, validated here; nothing from the project is executed on the host.
+  local port_flags=() p
+  if [ -f "$CFG/ports" ]; then
+    while IFS= read -r p || [ -n "$p" ]; do
+      p="${p%%#*}"; p="${p//[[:space:]]/}"
+      [ -z "$p" ] && continue
+      [[ "$p" =~ ^[0-9]+(:[0-9]+)?$ ]] || { echo "Invalid line in .sbxag/ports: $p" >&2; exit 1; }
+      [[ "$p" == *:* ]] || p="$p:$p"
+      port_flags+=(-p "$p")
+    done < "$CFG/ports"
+  fi
+
+  msb create --name "$NAME" \
+    --cpus "${CPUS:-3}" --max-cpus "${MAX_CPUS:-4}" \
+    --memory "${MEMORY:-4G}" --max-memory "${MAX_MEMORY:-8G}" \
+    --root-disk "flat:${DISK:-30G}" \
+    --mount-dir "$PWD:/workspace:rw" --workdir /workspace \
+    --mount-named "$VOL_CLAUDE:/root/.claude" \
+    --mount-named "$VOL_KEYRING:$KEYRING_DIR" \
+    -e "PATH=/root/.local/bin:/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    -e DEBIAN_FRONTEND=noninteractive \
+    -e CLAUDE_CONFIG_DIR=/root/.claude \
+    -e KEYRING_DIR="$KEYRING_DIR" \
+    -e XDG_RUNTIME_DIR=/run/user/0 \
+    -e DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
+    ${port_flags[@]+"${port_flags[@]}"} \
+    debian:trixie-slim
+}
+
+# Bring the sandbox to a usable state: create or start it, provision once, start services.
+up() {
+  if ! exists; then create; elif ! running; then msb start "$NAME"; fi
+  if ! msb exec --no-stdin -q "$NAME" -- test -f /opt/.provisioned; then
+    echo "First run: installing agents and project tools (a few minutes)..."
+    msb exec --no-stdin "$NAME" -- bash -c "$PROVISION"
+  fi
+  msb exec --no-stdin -q "$NAME" -- bash -c "$SERVICES"
+}
+
+usage() {
+  cat <<'EOF'
+sbxag — one microsandbox microVM per project, with AI coding agents inside.
+
+Usage (from the project root):
+  sbxag                 open a shell in the project's sandbox
+  sbxag agy [ARGS]      run Antigravity CLI
+  sbxag claude [ARGS]   run Claude Code
+  sbxag setup           re-run .sbxag/setup.sh
+  sbxag stop            stop the sandbox (keeps tools, data and logins)
+  sbxag destroy         remove the project's sandbox (logins are kept, they're shared)
+  sbxag update          update sbxag itself to the latest version
+  sbxag -h, --help      show this help
+
+Per-project config (optional), in .sbxag/:
+  setup.sh   runs as root in the VM on first run; install the toolchain here
+  ports      one port per line ("3000" or "8080:80"), forwarded to localhost
+
+Agent logins live in shared volumes (sbxag-claude, sbxag-keyring): sign in once per agent,
+every project's sandbox uses it. Reset with: msb volume rm sbxag-claude sbxag-keyring
+
+Environment overrides:
+  NAME=sbxag-<dir>  CPUS=3  MAX_CPUS=4  MEMORY=4G  MAX_MEMORY=8G  DISK=30G
+EOF
+}
+
+self_update() {
+  local url="https://raw.githubusercontent.com/singh-ramanpreet/sandboxed-agents/${REF:-main}/sbxag"
+  local self tmp
+  self="$(readlink -f "${BASH_SOURCE[0]}")"
+  tmp="$(mktemp "${self}.XXXXXX")"
+  trap 'rm -f "$tmp"' EXIT
+  curl -fsSL "$url" -o "$tmp"
+  head -n1 "$tmp" | grep -q '^#!/usr/bin/env bash' && bash -n "$tmp" \
+    || { echo "Download doesn't look like a valid sbxag: $url" >&2; exit 1; }
+  if cmp -s "$tmp" "$self"; then echo "sbxag is already up to date."; exit 0; fi
+  chmod 0755 "$tmp"
+  mv -f "$tmp" "$self"
+  trap - EXIT
+  echo "Updated $self"
+}
+
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  -h|--help) usage; exit 0 ;;
+  update) self_update; exit 0 ;;
+  stop)
+    if running; then msb stop "$NAME"; else echo "$NAME is not running."; fi
+    exit 0 ;;
+  destroy) msb rm -f "$NAME"; exit 0 ;;
+  setup)
+    [ -f "$CFG/setup.sh" ] || { echo "No .sbxag/setup.sh in this project." >&2; exit 1; }
+    up
+    msb exec -t "$NAME" -- bash -e /workspace/.sbxag/setup.sh
+    msb exec --no-stdin -q "$NAME" -- bash -c "$SERVICES"   # e.g. start Docker if setup just installed it
+    exit 0 ;;
+  "")
+    up
+    exec msb exec -t "$NAME" -- bash ;;
+  agy)
+    up
+    # SSH_* vars make agy use its "open this URL, paste the code" sign-in instead of a browser.
+    exec msb exec -t -e "SSH_CONNECTION=127.0.0.1 22 127.0.0.1 22" -e "SSH_CLIENT=127.0.0.1 22 22" \
+      "$NAME" -- agy "$@" ;;
+  claude)
+    up
+    exec msb exec -t "$NAME" -- claude "$@" ;;
+  *) usage >&2; exit 1 ;;
+esac
