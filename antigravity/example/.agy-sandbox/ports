@@ -1,0 +1,6 @@
+# Forwarded to localhost on the host. "3000" or "host:guest".
+54321   # Supabase API
+54322   # Postgres
+54323   # Studio
+54324   # Mailpit
+3000    # app dev server
