@@ -10,7 +10,9 @@
 #   agy-sandbox           create/start the sandbox and open agy
 #   agy-sandbox shell     open a shell instead
 #   agy-sandbox setup     re-run .agy-sandbox/setup.sh after editing it, then restart
+#   agy-sandbox stop      stop the sandbox (keeps login, tools and data)
 #   agy-sandbox destroy   remove the sandbox (login and all data inside it)
+#   agy-sandbox update    update this script to the latest version
 #
 # Resources (optional overrides): CPUS=3 MAX_CPUS=4 MEMORY=4G MAX_MEMORY=8G DISK=30G
 set -euo pipefail
@@ -100,7 +102,9 @@ Usage (from the project root):
   agy-sandbox             create/start the sandbox and open agy
   agy-sandbox shell       open a shell in the sandbox
   agy-sandbox setup       re-run .agy-sandbox/setup.sh, then restart
+  agy-sandbox stop        stop the sandbox (keeps login, tools and data)
   agy-sandbox destroy     remove the sandbox (login and all data inside it)
+  agy-sandbox update      update this script to the latest version
   agy-sandbox -h, --help  show this help
 
 Per-project config (optional), in .agy-sandbox/:
@@ -112,8 +116,28 @@ Environment overrides:
 EOF
 }
 
+self_update() {
+  local url="https://raw.githubusercontent.com/singh-ramanpreet/sandboxed-agents/${REF:-main}/antigravity/agy-sandbox"
+  local self tmp
+  self="$(readlink -f "${BASH_SOURCE[0]}")"
+  tmp="$(mktemp "${self}.XXXXXX")"
+  trap 'rm -f "$tmp"' EXIT
+  curl -fsSL "$url" -o "$tmp"
+  head -n1 "$tmp" | grep -q '^#!/usr/bin/env bash' && bash -n "$tmp" \
+    || { echo "Download doesn't look like a valid agy-sandbox: $url" >&2; exit 1; }
+  if cmp -s "$tmp" "$self"; then echo "agy-sandbox is already up to date."; exit 0; fi
+  chmod 0755 "$tmp"
+  mv -f "$tmp" "$self"
+  trap - EXIT
+  echo "Updated $self"
+}
+
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
+  update) self_update; exit 0 ;;
+  stop)
+    if running; then msb stop "$NAME"; else echo "$NAME is not running."; fi
+    exit 0 ;;
   destroy) msb rm -f "$NAME"; exit 0 ;;
   setup)
     [ -f "$CFG/setup.sh" ] || { echo "No .agy-sandbox/setup.sh in this project."; exit 1; }

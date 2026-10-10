@@ -5,8 +5,10 @@ Run [Antigravity CLI](https://antigravity.google/docs/cli/overview/) (`agy`) for
 ## Install
 
 ```sh
-cp agy-sandbox ~/.local/bin/ && chmod +x ~/.local/bin/agy-sandbox
+curl -fsSL https://raw.githubusercontent.com/singh-ramanpreet/sandboxed-agents/main/antigravity/install.sh | bash
 ```
+
+Installs to `~/.local/bin` (override with `BIN_DIR=...`). Update later with `agy-sandbox update`.
 
 Requires [microsandbox](https://github.com/superradcompany/microsandbox) (`msb`). On Linux your user needs access to `/dev/kvm` (`sudo usermod -aG kvm $USER`, then log in again).
 
@@ -18,7 +20,9 @@ From a project root:
 agy-sandbox           # create/start the sandbox and open agy
 agy-sandbox shell     # shell instead
 agy-sandbox setup     # re-run .agy-sandbox/setup.sh
+agy-sandbox stop      # stop the VM (keeps login and data)
 agy-sandbox destroy   # remove the sandbox
+agy-sandbox update    # update agy-sandbox itself
 ```
 
 First launch prints a sign-in URL: open it, sign in with Google, paste the code back. The login stays in the VM.
