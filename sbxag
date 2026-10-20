@@ -18,6 +18,7 @@ set -euo pipefail
 
 NAME="${NAME:-sbxag-$(basename "$PWD")}"
 CFG="$PWD/.sbxag"
+WORKDIR="/workspace/$(basename "$PWD")"   # where the project is mounted inside the VM
 
 # Shared, cross-project volumes holding agent logins.
 VOL_CLAUDE="${VOL_CLAUDE:-sbxag-claude}"       # Claude Code config + credentials (CLAUDE_CONFIG_DIR)
@@ -34,9 +35,9 @@ echo "=== installing Antigravity CLI (agy) ==="
 curl -fsSL https://antigravity.google/cli/install.sh | bash
 echo "=== installing Claude Code ==="
 curl -fsSL https://claude.ai/install.sh | bash
-if [ -f /workspace/.sbxag/setup.sh ]; then
-  echo "=== running /workspace/.sbxag/setup.sh ==="
-  bash -e /workspace/.sbxag/setup.sh
+if [ -f "$WORKDIR/.sbxag/setup.sh" ]; then
+  echo "=== running $WORKDIR/.sbxag/setup.sh ==="
+  bash -e "$WORKDIR/.sbxag/setup.sh"
 fi
 touch /opt/.provisioned
 '
@@ -102,13 +103,14 @@ create() {
     --cpus "${CPUS:-3}" --max-cpus "${MAX_CPUS:-4}" \
     --memory "${MEMORY:-4G}" --max-memory "${MAX_MEMORY:-8G}" \
     --root-disk "flat:${DISK:-30G}" \
-    --mount-dir "$PWD:/workspace:rw" --workdir /workspace \
+    --mount-dir "$PWD:$WORKDIR:rw" --workdir "$WORKDIR" \
     --mount-named "$VOL_CLAUDE:/root/.claude" \
     --mount-named "$VOL_KEYRING:$KEYRING_DIR" \
     -e "PATH=/root/.local/bin:/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     -e DEBIAN_FRONTEND=noninteractive \
     -e CLAUDE_CONFIG_DIR=/root/.claude \
     -e KEYRING_DIR="$KEYRING_DIR" \
+    -e WORKDIR="$WORKDIR" \
     -e XDG_RUNTIME_DIR=/run/user/0 \
     -e DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
     ${port_flags[@]+"${port_flags[@]}"} \
@@ -221,7 +223,7 @@ case "$cmd" in
   setup)
     [ -f "$CFG/setup.sh" ] || { echo "No .sbxag/setup.sh in this project." >&2; exit 1; }
     up
-    msb exec -t "$NAME" -- bash -e /workspace/.sbxag/setup.sh
+    msb exec -t "$NAME" -- bash -e "$WORKDIR/.sbxag/setup.sh"
     msb exec --no-stdin -q "$NAME" -- bash -c "$SERVICES"   # e.g. start Docker if setup just installed it
     exit 0 ;;
   "")
