@@ -76,6 +76,7 @@ exists()  { msb ls -q | grep -qx "$NAME"; }
 bound_ips() {
   msb inspect "$NAME" --format json 2>/dev/null \
     | grep -oE '"host_bind" *: *"[^"]*"' | sed -E 's/.*"([^"]*)"$/\1/' | sort -u
+  return 0   # no ports is not an error (grep finding nothing would abort the script under pipefail)
 }
 is_loopback() { [[ "$1" == 127.* ]]; }
 valid_ipv4() {
