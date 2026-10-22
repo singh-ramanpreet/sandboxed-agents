@@ -6,8 +6,12 @@
 # never duplicates the environment. Agent logins are kept in named volumes shared by all
 # project sandboxes: sign in once per agent, use it everywhere.
 #
+# Shells and agents run as a guest user named after the host user, with the same uid/gid and
+# passwordless sudo: some tools refuse to run as root (e.g. claude --dangerously-skip-permissions).
+#
 # Per project (optional), in <project>/.sbxag/:
-#   setup.sh  runs as root INSIDE the VM on first run — install the project's toolchain there.
+#   setup.sh  runs as root INSIDE the VM on first run — install the project's toolchain there,
+#             system-wide (e.g. /usr/local) so the guest user can run it.
 #             If it installs Docker (dockerd), Docker is started automatically on every launch.
 #   ports     one port per line ("3000", or "8080:80" for host:guest), forwarded to localhost.
 #             Use --host to make them reachable from other machines. Ports are fixed when the
@@ -20,21 +24,48 @@ NAME="${NAME:-sbxag-$(basename "$PWD")}"
 CFG="$PWD/.sbxag"
 WORKDIR="/workspace/$(basename "$PWD")"   # where the project is mounted inside the VM
 
+# Guest user: the host user's name (made a valid Linux name), uid and gid. A root host user
+# gets a regular "sbxag" user instead, since the point is not to run as root.
+if [ "$(id -u)" -eq 0 ]; then
+  SBX_USER=sbxag SBX_UID=1000 SBX_GID=1000
+else
+  SBX_USER="$(id -un | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_\n-' '_')"
+  [[ "$SBX_USER" =~ ^[a-z_] ]] || SBX_USER="u$SBX_USER"
+  SBX_USER="${SBX_USER:0:32}" SBX_UID="$(id -u)" SBX_GID="$(id -g)"
+fi
+SBX_HOME="/home/$SBX_USER"
+# Files on the mounts below appear owned by the guest user (guest view only: host files keep
+# their owner).
+OWNER="uid=$SBX_UID,gid=$SBX_GID"
+
 # Shared, cross-project volumes holding agent logins.
 VOL_CLAUDE="${VOL_CLAUDE:-sbxag-claude}"       # Claude Code config + credentials (CLAUDE_CONFIG_DIR)
 VOL_KEYRING="${VOL_KEYRING:-sbxag-keyring}"    # gnome-keyring files, where agy keeps its Google login
-KEYRING_DIR=/root/.local/share/keyrings
+KEYRING_DIR="$SBX_HOME/.local/share/keyrings"
 
-# Provisioning: runs once per project sandbox, the first time it is created.
+# Flags for commands that run as the guest user rather than root.
+AS_USER=(--user "$SBX_USER" -e "HOME=$SBX_HOME" -e "USER=$SBX_USER" -e "LOGNAME=$SBX_USER")
+
+# Provisioning: runs once per project sandbox, as root, the first time it is created.
 PROVISION='
 set -e
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl git unzip bash procps openssl \
-  dbus dbus-x11 gnome-keyring
+  dbus dbus-x11 gnome-keyring sudo
+echo "=== creating user $SBX_USER ($SBX_UID:$SBX_GID) ==="
+if ! id -u "$SBX_USER" >/dev/null 2>&1; then
+  getent group "$SBX_GID" >/dev/null || groupadd -g "$SBX_GID" "$SBX_USER"
+  # The home already exists: the login volumes are mounted inside it.
+  useradd -M -d "$SBX_HOME" -u "$SBX_UID" -g "$SBX_GID" -s /bin/bash "$SBX_USER"
+fi
+cp -r /etc/skel/. "$SBX_HOME"/
+chown -R "$SBX_UID:$SBX_GID" "$SBX_HOME"   # including logins saved by older, root-only versions
+echo "$SBX_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/sbxag && chmod 0440 /etc/sudoers.d/sbxag
+as_user() { runuser -u "$SBX_USER" -- env HOME="$SBX_HOME" USER="$SBX_USER" bash -c "$1"; }
 echo "=== installing Antigravity CLI (agy) ==="
-curl -fsSL https://antigravity.google/cli/install.sh | bash
+as_user "curl -fsSL https://antigravity.google/cli/install.sh | bash"
 echo "=== installing Claude Code ==="
-curl -fsSL https://claude.ai/install.sh | bash
+as_user "curl -fsSL https://claude.ai/install.sh | bash"
 if [ -f "$WORKDIR/.sbxag/setup.sh" ]; then
   echo "=== running $WORKDIR/.sbxag/setup.sh ==="
   bash -e "$WORKDIR/.sbxag/setup.sh"
@@ -44,30 +75,36 @@ touch /opt/.provisioned
 
 # Services: run on every launch (microsandbox does not re-run anything when a stopped sandbox
 # starts again). Idempotent: only starts what is not already running. Daemons are detached
-# with setsid so they outlive this exec.
-SERVICES='
+# with setsid so they outlive this exec. The root part runs first, then the user part.
+SERVICES_ROOT='
 set -e
-mkdir -p /run/user/0 && chmod 700 /run/user/0
+mkdir -p "$XDG_RUNTIME_DIR"
+chown "$SBX_UID:$SBX_GID" "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+# Docker, only if the project setup installed it. The socket belongs to the primary group of
+# the user, so the user can reach it without supplementary groups.
+if command -v dockerd >/dev/null 2>&1 && ! docker info >/dev/null 2>&1; then
+  # /run survives a stop/start here, so clear pid files and sockets left by the previous boot.
+  rm -f /var/run/docker.pid /var/run/docker.sock /var/run/docker/containerd/containerd.pid
+  setsid -f dockerd --group "$(getent group "$SBX_GID" | cut -d: -f1)" \
+    >/var/log/dockerd.log 2>&1 </dev/null
+  timeout 180 sh -c "until docker info >/dev/null 2>&1; do sleep 1; done" \
+    || { tail -50 /var/log/dockerd.log; docker info; exit 1; }
+fi
+'
+SERVICES_USER='
+set -e
 names() { dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply \
             / org.freedesktop.DBus.ListNames 2>/dev/null; }
 # D-Bus session + unlocked keyring (agy stores its login there). The keyring lives on a volume
 # shared by all project sandboxes, so its password is kept next to it, in that same volume.
 if ! names >/dev/null; then
-  rm -f /run/user/0/bus
+  rm -f "$XDG_RUNTIME_DIR/bus"
   dbus-daemon --session --address="$DBUS_SESSION_BUS_ADDRESS" --fork --nopidfile
 fi
 if ! names | grep -q org.freedesktop.secrets; then
   pw="$KEYRING_DIR/.sbxag-password"
   [ -s "$pw" ] || { (umask 077; openssl rand -hex 16 > "$pw"); }
   gnome-keyring-daemon --daemonize --unlock --components=secrets < "$pw" >/dev/null
-fi
-# Docker, only if the project setup installed it.
-if command -v dockerd >/dev/null 2>&1 && ! docker info >/dev/null 2>&1; then
-  # /run survives a stop/start here, so clear pid files and sockets left by the previous boot.
-  rm -f /var/run/docker.pid /var/run/docker.sock /var/run/docker/containerd/containerd.pid
-  setsid -f dockerd >/var/log/dockerd.log 2>&1 </dev/null
-  timeout 180 sh -c "until docker info >/dev/null 2>&1; do sleep 1; done" \
-    || { tail -50 /var/log/dockerd.log; docker info; exit 1; }
 fi
 '
 
@@ -104,16 +141,17 @@ create() {
     --cpus "${CPUS:-3}" --max-cpus "${MAX_CPUS:-4}" \
     --memory "${MEMORY:-4G}" --max-memory "${MAX_MEMORY:-8G}" \
     --root-disk "flat:${DISK:-30G}" \
-    --mount-dir "$PWD:$WORKDIR:rw" --workdir "$WORKDIR" \
-    --mount-named "$VOL_CLAUDE:/root/.claude" \
-    --mount-named "$VOL_KEYRING:$KEYRING_DIR" \
-    -e "PATH=/root/.local/bin:/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    --mount-dir "$PWD:$WORKDIR:rw,$OWNER" --workdir "$WORKDIR" \
+    --mount-named "$VOL_CLAUDE:$SBX_HOME/.claude:$OWNER" \
+    --mount-named "$VOL_KEYRING:$KEYRING_DIR:$OWNER" \
+    -e "PATH=$SBX_HOME/.local/bin:$SBX_HOME/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     -e DEBIAN_FRONTEND=noninteractive \
-    -e CLAUDE_CONFIG_DIR=/root/.claude \
+    -e CLAUDE_CONFIG_DIR="$SBX_HOME/.claude" \
     -e KEYRING_DIR="$KEYRING_DIR" \
     -e WORKDIR="$WORKDIR" \
-    -e XDG_RUNTIME_DIR=/run/user/0 \
-    -e DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
+    -e SBX_USER="$SBX_USER" -e SBX_UID="$SBX_UID" -e SBX_GID="$SBX_GID" -e SBX_HOME="$SBX_HOME" \
+    -e XDG_RUNTIME_DIR="/run/user/$SBX_UID" \
+    -e DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$SBX_UID/bus" \
     ${port_flags[@]+"${port_flags[@]}"} \
     debian:trixie-slim
 
@@ -140,11 +178,20 @@ up() {
     fi
     running || msb start "$NAME"
   fi
-  if ! msb exec --no-stdin -q "$NAME" -- test -f /opt/.provisioned; then
-    echo "First run: installing agents and project tools (a few minutes)..."
-    msb exec --no-stdin "$NAME" -- bash -c "$PROVISION"
-  fi
-  msb exec --no-stdin -q "$NAME" -- bash -c "$SERVICES"
+  local state
+  state="$(msb exec --no-stdin -q -e "SBX_USER=$SBX_USER" "$NAME" -- bash -c \
+    'if [ ! -f /opt/.provisioned ]; then echo new; elif id -u "$SBX_USER" >/dev/null 2>&1; then echo ok; else echo old; fi')"
+  case "$state" in
+    new)
+      echo "First run: installing agents and project tools (a few minutes)..."
+      msb exec --no-stdin "$NAME" -- bash -c "$PROVISION" ;;
+    old)
+      echo "$NAME was created by an older sbxag that runs everything as root." \
+        "Run 'sbxag destroy' and start again; your agent logins are kept (they're in shared volumes)." >&2
+      exit 1 ;;
+  esac
+  msb exec --no-stdin -q "$NAME" -- bash -c "$SERVICES_ROOT"
+  msb exec --no-stdin -q "${AS_USER[@]}" "$NAME" -- bash -c "$SERVICES_USER"
 }
 
 usage() {
@@ -153,7 +200,7 @@ sbxag — one microsandbox microVM per project, with AI coding agents inside.
 
 Usage (from the project root):
   sbxag [--host [IP]] [COMMAND]
-  sbxag                 open a shell in the project's sandbox
+  sbxag                 open a shell in the project's sandbox (as you; sudo works)
   sbxag agy [ARGS]      run Antigravity CLI
   sbxag claude [ARGS]   run Claude Code
   sbxag setup           re-run .sbxag/setup.sh
@@ -168,7 +215,8 @@ Options:
                         Applies when the sandbox is created.
 
 Per-project config (optional), in .sbxag/:
-  setup.sh   runs as root in the VM on first run; install the toolchain here
+  setup.sh   runs as root in the VM on first run; install the toolchain here, system-wide
+             (e.g. /usr/local) so the guest user can run it
   ports      one port per line ("3000" or "8080:80"), forwarded to localhost (see --host).
              Fixed at creation: after editing, run `sbxag destroy` and start again.
 
@@ -225,18 +273,18 @@ case "$cmd" in
     [ -f "$CFG/setup.sh" ] || { echo "No .sbxag/setup.sh in this project." >&2; exit 1; }
     up
     msb exec -t "$NAME" -- bash -e "$WORKDIR/.sbxag/setup.sh"
-    msb exec --no-stdin -q "$NAME" -- bash -c "$SERVICES"   # e.g. start Docker if setup just installed it
+    msb exec --no-stdin -q "$NAME" -- bash -c "$SERVICES_ROOT"   # e.g. start Docker if setup just installed it
     exit 0 ;;
   "")
     up
-    exec msb exec -t "$NAME" -- bash ;;
+    exec msb exec -t "${AS_USER[@]}" "$NAME" -- bash ;;
   agy)
     up
     # SSH_* vars make agy use its "open this URL, paste the code" sign-in instead of a browser.
-    exec msb exec -t -e "SSH_CONNECTION=127.0.0.1 22 127.0.0.1 22" -e "SSH_CLIENT=127.0.0.1 22 22" \
+    exec msb exec -t "${AS_USER[@]}" -e "SSH_CONNECTION=127.0.0.1 22 127.0.0.1 22" -e "SSH_CLIENT=127.0.0.1 22 22" \
       "$NAME" -- agy "$@" ;;
   claude)
     up
-    exec msb exec -t "$NAME" -- claude "$@" ;;
+    exec msb exec -t "${AS_USER[@]}" "$NAME" -- claude "$@" ;;
   *) usage >&2; exit 1 ;;
 esac
