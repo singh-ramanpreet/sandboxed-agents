@@ -13,6 +13,8 @@
 #   setup.sh  runs as root INSIDE the VM on first run — install the project's toolchain there,
 #             system-wide (e.g. /usr/local) so the guest user can run it.
 #             If it installs Docker (dockerd), Docker is started automatically on every launch.
+#   setup-user.sh  runs as the guest user right after setup.sh: things that belong in $HOME
+#             (dotfiles, per-user toolchains like rustup/nvm/uv, project dependencies).
 #   ports     one port per line ("3000", or "8080:80" for host:guest), forwarded to localhost.
 #             Use --host to make them reachable from other machines. Ports are fixed when the
 #             sandbox is created: after changing them, run `sbxag destroy` and start again.
@@ -61,14 +63,18 @@ fi
 cp -r /etc/skel/. "$SBX_HOME"/
 chown -R "$SBX_UID:$SBX_GID" "$SBX_HOME"   # including logins saved by older, root-only versions
 echo "$SBX_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/sbxag && chmod 0440 /etc/sudoers.d/sbxag
-as_user() { runuser -u "$SBX_USER" -- env HOME="$SBX_HOME" USER="$SBX_USER" bash -c "$1"; }
+as_user() { runuser -u "$SBX_USER" -- env HOME="$SBX_HOME" USER="$SBX_USER" "$@"; }
 echo "=== installing Antigravity CLI (agy) ==="
-as_user "curl -fsSL https://antigravity.google/cli/install.sh | bash"
+as_user bash -c "curl -fsSL https://antigravity.google/cli/install.sh | bash"
 echo "=== installing Claude Code ==="
-as_user "curl -fsSL https://claude.ai/install.sh | bash"
+as_user bash -c "curl -fsSL https://claude.ai/install.sh | bash"
 if [ -f "$WORKDIR/.sbxag/setup.sh" ]; then
   echo "=== running $WORKDIR/.sbxag/setup.sh ==="
   bash -e "$WORKDIR/.sbxag/setup.sh"
+fi
+if [ -f "$WORKDIR/.sbxag/setup-user.sh" ]; then
+  echo "=== running $WORKDIR/.sbxag/setup-user.sh as $SBX_USER ==="
+  (cd "$WORKDIR" && as_user bash -e "$WORKDIR/.sbxag/setup-user.sh")
 fi
 touch /opt/.provisioned
 '
@@ -203,7 +209,7 @@ Usage (from the project root):
   sbxag                 open a shell in the project's sandbox (as you; sudo works)
   sbxag agy [ARGS]      run Antigravity CLI
   sbxag claude [ARGS]   run Claude Code
-  sbxag setup           re-run .sbxag/setup.sh
+  sbxag setup           re-run .sbxag/setup.sh, then .sbxag/setup-user.sh
   sbxag stop            stop the sandbox (keeps tools, data and logins)
   sbxag destroy         remove the project's sandbox (logins are kept, they're shared)
   sbxag update          update sbxag itself to the latest version
@@ -217,6 +223,8 @@ Options:
 Per-project config (optional), in .sbxag/:
   setup.sh   runs as root in the VM on first run; install the toolchain here, system-wide
              (e.g. /usr/local) so the guest user can run it
+  setup-user.sh  runs as you right after setup.sh, in the project dir; for things that
+             belong in $HOME (dotfiles, rustup/nvm/uv, project dependencies)
   ports      one port per line ("3000" or "8080:80"), forwarded to localhost (see --host).
              Fixed at creation: after editing, run `sbxag destroy` and start again.
 
@@ -270,10 +278,16 @@ case "$cmd" in
     exit 0 ;;
   destroy) msb rm -f "$NAME"; exit 0 ;;
   setup)
-    [ -f "$CFG/setup.sh" ] || { echo "No .sbxag/setup.sh in this project." >&2; exit 1; }
+    [ -f "$CFG/setup.sh" ] || [ -f "$CFG/setup-user.sh" ] \
+      || { echo "No .sbxag/setup.sh or .sbxag/setup-user.sh in this project." >&2; exit 1; }
     up
-    msb exec -t "$NAME" -- bash -e "$WORKDIR/.sbxag/setup.sh"
-    msb exec --no-stdin -q "$NAME" -- bash -c "$SERVICES_ROOT"   # e.g. start Docker if setup just installed it
+    if [ -f "$CFG/setup.sh" ]; then
+      msb exec -t "$NAME" -- bash -e "$WORKDIR/.sbxag/setup.sh"
+      msb exec --no-stdin -q "$NAME" -- bash -c "$SERVICES_ROOT"   # e.g. start Docker if setup just installed it
+    fi
+    if [ -f "$CFG/setup-user.sh" ]; then
+      msb exec -t "${AS_USER[@]}" "$NAME" -- bash -e "$WORKDIR/.sbxag/setup-user.sh"
+    fi
     exit 0 ;;
   "")
     up
