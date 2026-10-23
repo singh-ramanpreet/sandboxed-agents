@@ -143,11 +143,14 @@ create() {
     done < "$CFG/ports"
   fi
 
+  # host-perms=mirror: modes set in the guest (new files, chmod +x) reach the host files too;
+  # by default they stay inside the sandbox, which breaks git and executable scripts.
+  # The login volumes keep the default: they hold credentials.
   msb create --name "$NAME" \
     --cpus "${CPUS:-3}" --max-cpus "${MAX_CPUS:-4}" \
     --memory "${MEMORY:-4G}" --max-memory "${MAX_MEMORY:-8G}" \
     --root-disk "flat:${DISK:-30G}" \
-    --mount-dir "$PWD:$WORKDIR:rw,$OWNER" --workdir "$WORKDIR" \
+    --mount-dir "$PWD:$WORKDIR:rw,$OWNER,host-perms=mirror" --workdir "$WORKDIR" \
     --mount-named "$VOL_CLAUDE:$SBX_HOME/.claude:$OWNER" \
     --mount-named "$VOL_KEYRING:$KEYRING_DIR:$OWNER" \
     -e "PATH=$SBX_HOME/.local/bin:$SBX_HOME/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
