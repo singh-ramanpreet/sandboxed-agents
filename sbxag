@@ -143,6 +143,13 @@ create() {
     done < "$CFG/ports"
   fi
 
+  # Optional extra flags passed to msb create (e.g. MSB_ARGS="--net public,private")
+  local msb_args=()
+  if [ -n "${MSB_ARGS:-}" ]; then
+    # Parse respecting quotes/words
+    eval "msb_args=($MSB_ARGS)"
+  fi
+
   # host-perms=mirror: modes set in the guest (new files, chmod +x) reach the host files too;
   # by default they stay inside the sandbox, which breaks git and executable scripts.
   # The login volumes keep the default: they hold credentials.
@@ -162,6 +169,7 @@ create() {
     -e XDG_RUNTIME_DIR="/run/user/$SBX_UID" \
     -e DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$SBX_UID/bus" \
     ${port_flags[@]+"${port_flags[@]}"} \
+    ${msb_args[@]+"${msb_args[@]}"} \
     debian:trixie-slim
 
   if [ ${#port_flags[@]} -gt 0 ] && ! is_loopback "$HOST_BIND"; then
@@ -236,6 +244,7 @@ every project's sandbox uses it. Reset with: msb volume rm sbxag-claude sbxag-ke
 
 Environment overrides:
   NAME=sbxag-<dir>  CPUS=3  MAX_CPUS=4  MEMORY=4G  MAX_MEMORY=8G  DISK=30G
+  MSB_ARGS="..."    extra arguments passed to msb create (e.g. MSB_ARGS="--net public,private")
 EOF
 }
 
