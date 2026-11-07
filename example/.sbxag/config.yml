@@ -1,0 +1,23 @@
+# Sandbox configuration — applied when the sandbox is created.
+# After editing this file, run `sbxag destroy` and start again.
+
+# cpus: 3
+# max_cpus: 4
+# memory: 4G
+# max_memory: 8G
+# disk: 30G
+# image: debian:trixie-slim
+
+# Shared named volumes ("volume:guest_path"; relative paths are inside $HOME).
+volumes:
+  - sbxag-claude:.claude
+  - sbxag-agy:.gemini
+  - sbxag-keyring:.local/share/keyrings
+
+# Forwarded ports ("[ip:]host_port[:guest_port]", bound to 127.0.0.1 by default, or "0.0.0.0:3000" to expose on your network).
+ports:
+  - 54321   # Supabase API
+  - 54322   # Postgres
+  - 54323   # Studio
+  - 54324   # Mailpit
+  - 3000    # app dev server

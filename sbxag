@@ -1,23 +1,17 @@
 #!/usr/bin/env bash
-# sbxag — one microsandbox microVM per project, with AI coding agents inside.
+# sbxag — one microsandbox microVM per project.
 #
-# The project's dev environment (Docker, databases, toolchains) is built once per project.
-# Agents (agy, claude) are lightweight and all live in the same VM, so switching agents
-# never duplicates the environment. Agent logins are kept in named volumes shared by all
-# project sandboxes: sign in once per agent, use it everywhere.
-#
-# Shells and agents run as a guest user named after the host user, with the same uid/gid and
+# Shells run as a guest user named after the host user, with the same uid/gid and
 # passwordless sudo: some tools refuse to run as root (e.g. claude --dangerously-skip-permissions).
 #
 # Per project (optional), in <project>/.sbxag/:
-#   setup.sh  runs as root INSIDE the VM on first run — install the project's toolchain there,
-#             system-wide (e.g. /usr/local) so the guest user can run it.
-#             If it installs Docker (dockerd), Docker is started automatically on every launch.
+#   config.yml     settings applied when the sandbox is created (cpus, max_cpus, memory,
+#                  max_memory, disk, image, ports, volumes).
+#                  After changing config.yml, run `sbxag destroy` and start again.
+#   setup.sh       runs as root INSIDE the VM on first run — install system packages,
+#                  daemons (e.g. Docker), and system-wide toolchains (/usr/local).
 #   setup-user.sh  runs as the guest user right after setup.sh: things that belong in $HOME
-#             (dotfiles, per-user toolchains like rustup/nvm/uv, project dependencies).
-#   ports     one port per line ("3000", or "8080:80" for host:guest), forwarded to localhost.
-#             Use --host to make them reachable from other machines. Ports are fixed when the
-#             sandbox is created: after changing them, run `sbxag destroy` and start again.
+#                  (agents like claude/agy, dotfiles, rustup/nvm/uv, project dependencies).
 #
 # Run `sbxag -h` for usage.
 set -euo pipefail
@@ -40,11 +34,6 @@ SBX_HOME="/home/$SBX_USER"
 # their owner).
 OWNER="uid=$SBX_UID,gid=$SBX_GID"
 
-# Shared, cross-project volumes holding agent logins.
-VOL_CLAUDE="${VOL_CLAUDE:-sbxag-claude}"       # Claude Code config + credentials (CLAUDE_CONFIG_DIR)
-VOL_KEYRING="${VOL_KEYRING:-sbxag-keyring}"    # gnome-keyring files, where agy keeps its Google login
-KEYRING_DIR="$SBX_HOME/.local/share/keyrings"
-
 # Flags for commands that run as the guest user rather than root.
 AS_USER=(--user "$SBX_USER" -e "HOME=$SBX_HOME" -e "USER=$SBX_USER" -e "LOGNAME=$SBX_USER")
 
@@ -52,22 +41,17 @@ AS_USER=(--user "$SBX_USER" -e "HOME=$SBX_HOME" -e "USER=$SBX_USER" -e "LOGNAME=
 PROVISION='
 set -e
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl git unzip bash procps openssl \
-  dbus dbus-x11 gnome-keyring sudo
+apt-get install -y --no-install-recommends sudo ca-certificates
 echo "=== creating user $SBX_USER ($SBX_UID:$SBX_GID) ==="
 if ! id -u "$SBX_USER" >/dev/null 2>&1; then
   getent group "$SBX_GID" >/dev/null || groupadd -g "$SBX_GID" "$SBX_USER"
-  # The home already exists: the login volumes are mounted inside it.
-  useradd -M -d "$SBX_HOME" -u "$SBX_UID" -g "$SBX_GID" -s /bin/bash "$SBX_USER"
+  useradd -o -M -d "$SBX_HOME" -u "$SBX_UID" -g "$SBX_GID" -s /bin/bash "$SBX_USER"
 fi
+mkdir -p "$SBX_HOME"
 cp -r /etc/skel/. "$SBX_HOME"/
-chown -R "$SBX_UID:$SBX_GID" "$SBX_HOME"   # including logins saved by older, root-only versions
+chown -R "$SBX_UID:$SBX_GID" "$SBX_HOME"
 echo "$SBX_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/sbxag && chmod 0440 /etc/sudoers.d/sbxag
-as_user() { runuser -u "$SBX_USER" -- env HOME="$SBX_HOME" USER="$SBX_USER" "$@"; }
-echo "=== installing Antigravity CLI (agy) ==="
-as_user bash -c "curl -fsSL https://antigravity.google/cli/install.sh | bash"
-echo "=== installing Claude Code ==="
-as_user bash -c "curl -fsSL https://claude.ai/install.sh | bash"
+as_user() { runuser -u "$SBX_USER" -- env HOME="$SBX_HOME" USER="$SBX_USER" LOGNAME="$SBX_USER" "$@"; }
 if [ -f "$WORKDIR/.sbxag/setup.sh" ]; then
   echo "=== running $WORKDIR/.sbxag/setup.sh ==="
   bash -e "$WORKDIR/.sbxag/setup.sh"
@@ -79,48 +63,7 @@ fi
 touch /opt/.provisioned
 '
 
-# Services: run on every launch (microsandbox does not re-run anything when a stopped sandbox
-# starts again). Idempotent: only starts what is not already running. Daemons are detached
-# with setsid so they outlive this exec. The root part runs first, then the user part.
-SERVICES_ROOT='
-set -e
-mkdir -p "$XDG_RUNTIME_DIR"
-chown "$SBX_UID:$SBX_GID" "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
-# Docker, only if the project setup installed it. The socket belongs to the primary group of
-# the user, so the user can reach it without supplementary groups.
-if command -v dockerd >/dev/null 2>&1 && ! docker info >/dev/null 2>&1; then
-  # /run survives a stop/start here, so clear pid files and sockets left by the previous boot.
-  rm -f /var/run/docker.pid /var/run/docker.sock /var/run/docker/containerd/containerd.pid
-  setsid -f dockerd --group "$(getent group "$SBX_GID" | cut -d: -f1)" \
-    >/var/log/dockerd.log 2>&1 </dev/null
-  timeout 180 sh -c "until docker info >/dev/null 2>&1; do sleep 1; done" \
-    || { tail -50 /var/log/dockerd.log; docker info; exit 1; }
-fi
-'
-SERVICES_USER='
-set -e
-names() { dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply \
-            / org.freedesktop.DBus.ListNames 2>/dev/null; }
-# D-Bus session + unlocked keyring (agy stores its login there). The keyring lives on a volume
-# shared by all project sandboxes, so its password is kept next to it, in that same volume.
-if ! names >/dev/null; then
-  rm -f "$XDG_RUNTIME_DIR/bus"
-  dbus-daemon --session --address="$DBUS_SESSION_BUS_ADDRESS" --fork --nopidfile
-fi
-if ! names | grep -q org.freedesktop.secrets; then
-  pw="$KEYRING_DIR/.sbxag-password"
-  [ -s "$pw" ] || { (umask 077; openssl rand -hex 16 > "$pw"); }
-  gnome-keyring-daemon --daemonize --unlock --components=secrets < "$pw" >/dev/null
-fi
-'
-
-exists()  { msb ls -q | grep -qx "$NAME"; }
-# Distinct host addresses the existing sandbox's ports are bound to (fixed at creation).
-bound_ips() {
-  msb inspect "$NAME" --format json 2>/dev/null \
-    | grep -oE '"host_bind" *: *"[^"]*"' | sed -E 's/.*"([^"]*)"$/\1/' | sort -u
-  return 0   # no ports is not an error (grep finding nothing would abort the script under pipefail)
-}
+exists()  { msb ls -q | grep -Fxq "$NAME"; }
 is_loopback() { [[ "$1" == 127.* ]]; }
 valid_ipv4() {
   local IFS=. o; local -a parts
@@ -128,71 +71,133 @@ valid_ipv4() {
   read -ra parts <<< "$1"
   for o in "${parts[@]}"; do (( 10#$o <= 255 )) || return 1; done
 }
-running() { msb ls -q --running | grep -qx "$NAME"; }
+valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+running() { msb ls -q --running | grep -Fxq "$NAME"; }
+
+# Parse .sbxag/config.yml safely without executing anything on the host.
+load_config() {
+  local line k v list_key=
+  cfg_cpus= cfg_max_cpus= cfg_memory= cfg_max_memory= cfg_disk= cfg_image=
+  cfg_ports= cfg_volumes=
+  [ -f "$CFG/config.yml" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    if [[ "$line" =~ ^[[:space:]]*-[[:space:]]+(.*)$ ]]; then
+      v="${BASH_REMATCH[1]}"
+      if [[ "$v" =~ ^\"(.*)\"$ ]] || [[ "$v" =~ ^\'(.*)\'$ ]]; then v="${BASH_REMATCH[1]}"; fi
+      case "$list_key" in
+        ports)   cfg_ports+="$v " ;;
+        volumes) cfg_volumes+="$v " ;;
+        *) echo "Unexpected list item in .sbxag/config.yml: $line" >&2; exit 1 ;;
+      esac
+      continue
+    fi
+    list_key=
+    if [[ ! "$line" =~ ^[[:space:]]*([a-zA-Z_]+):[[:space:]]*(.*)$ ]]; then
+      echo "Invalid line in .sbxag/config.yml: $line" >&2; exit 1
+    fi
+    k="${BASH_REMATCH[1],,}" v="${BASH_REMATCH[2]}"
+    if [[ "$v" =~ ^\"(.*)\"$ ]] || [[ "$v" =~ ^\'(.*)\'$ ]]; then v="${BASH_REMATCH[1]}"; fi
+    case "$k" in
+      cpus)       cfg_cpus="$v" ;;
+      max_cpus)   cfg_max_cpus="$v" ;;
+      memory)     cfg_memory="$v" ;;
+      max_memory) cfg_max_memory="$v" ;;
+      disk)       cfg_disk="$v" ;;
+      image)      cfg_image="$v" ;;
+      ports)
+        if [ -z "$v" ]; then list_key=ports
+        else v="${v#\[}"; v="${v%\]}"; cfg_ports+="${v//,/ } "; fi ;;
+      volumes)
+        if [ -z "$v" ]; then list_key=volumes
+        else v="${v#\[}"; v="${v%\]}"; cfg_volumes+="${v//,/ } "; fi ;;
+      *) echo "Unknown key in .sbxag/config.yml: $k" >&2; exit 1 ;;
+    esac
+  done < "$CFG/config.yml"
+}
 
 create() {
-  # Ports come from a plain list, validated here; nothing from the project is executed on the host.
-  local port_flags=() p
-  if [ -f "$CFG/ports" ]; then
-    while IFS= read -r p || [ -n "$p" ]; do
-      p="${p%%#*}"; p="${p//[[:space:]]/}"
-      [ -z "$p" ] && continue
-      [[ "$p" =~ ^[0-9]+(:[0-9]+)?$ ]] || { echo "Invalid line in .sbxag/ports: $p" >&2; exit 1; }
-      [[ "$p" == *:* ]] || p="$p:$p"
-      port_flags+=(-p "$HOST_BIND:$p")
-    done < "$CFG/ports"
-  fi
+  load_config
+  local cpus="${CPUS:-${cfg_cpus:-3}}"
+  local max_cpus="${MAX_CPUS:-${cfg_max_cpus:-4}}"
+  local memory="${MEMORY:-${cfg_memory:-4G}}"
+  local max_memory="${MAX_MEMORY:-${cfg_max_memory:-8G}}"
+  local disk="${DISK:-${cfg_disk:-30G}}"
+  local image="${IMAGE:-${cfg_image:-debian:trixie-slim}}"
+  local ports_raw="${PORTS:-${cfg_ports:-}}"
+  local volumes_raw="${VOLUMES:-${cfg_volumes:-}}"
 
-  # Optional extra flags passed to msb create (e.g. MSB_ARGS="--net public,private")
+  [[ "$cpus" =~ ^[0-9]+$ ]]            || { echo "Invalid cpus: $cpus" >&2; exit 1; }
+  [[ "$max_cpus" =~ ^[0-9]+$ ]]        || { echo "Invalid max_cpus: $max_cpus" >&2; exit 1; }
+  [[ "$memory" =~ ^[0-9]+[MGT]?B?$ ]]  || { echo "Invalid memory: $memory" >&2; exit 1; }
+  [[ "$max_memory" =~ ^[0-9]+[MGT]?B?$ ]] || { echo "Invalid max_memory: $max_memory" >&2; exit 1; }
+  [[ "$disk" =~ ^[0-9]+[MGT]?B?$ ]]    || { echo "Invalid disk: $disk" >&2; exit 1; }
+  [[ "$image" =~ ^[a-zA-Z0-9_./:@-]+$ && "$image" != -* ]] || { echo "Invalid image: $image" >&2; exit 1; }
+
+  local port_flags=() exposed=() ports_list=() p ip host_port guest_port
+  read -ra ports_list <<< "$ports_raw"
+  for p in ${ports_list[@]+"${ports_list[@]}"}; do
+    if [[ "$p" =~ ^([0-9.]+):([0-9]+)(:([0-9]+))?$ ]]; then
+      ip="${BASH_REMATCH[1]}" host_port="${BASH_REMATCH[2]}" guest_port="${BASH_REMATCH[4]:-${BASH_REMATCH[2]}}"
+      valid_ipv4 "$ip" || { echo "Invalid IP in ports: $p" >&2; exit 1; }
+    elif [[ "$p" =~ ^([0-9]+)(:([0-9]+))?$ ]]; then
+      ip="127.0.0.1" host_port="${BASH_REMATCH[1]}" guest_port="${BASH_REMATCH[3]:-${BASH_REMATCH[1]}}"
+    else
+      echo "Invalid port in ports: $p" >&2; exit 1
+    fi
+    valid_port "$host_port" && valid_port "$guest_port" \
+      || { echo "Port out of range (1-65535) in ports: $p" >&2; exit 1; }
+    port_flags+=(-p "$ip:$host_port:$guest_port")
+    is_loopback "$ip" || exposed+=("$ip:$host_port:$guest_port")
+  done
+
+  local vol_flags=() volumes_list=() v vol_name guest_path
+  read -ra volumes_list <<< "$volumes_raw"
+  for v in ${volumes_list[@]+"${volumes_list[@]}"}; do
+    if [[ ! "$v" =~ ^([a-zA-Z0-9_.-]+):([a-zA-Z0-9_./-]+)$ ]] || [[ "$v" == *..* ]]; then
+      echo "Invalid volume in volumes (expected name:path): $v" >&2; exit 1
+    fi
+    vol_name="${BASH_REMATCH[1]}" guest_path="${BASH_REMATCH[2]}"
+    [[ "$guest_path" == /* ]] || guest_path="$SBX_HOME/$guest_path"
+    vol_flags+=(--mount-named "$vol_name:$guest_path:$OWNER")
+  done
+
+  # Optional extra flags passed to msb create from the host environment (e.g. MSB_ARGS="--net public,private")
   local msb_args=()
   if [ -n "${MSB_ARGS:-}" ]; then
-    # Parse respecting quotes/words
     eval "msb_args=($MSB_ARGS)"
   fi
 
   # host-perms=mirror: modes set in the guest (new files, chmod +x) reach the host files too;
   # by default they stay inside the sandbox, which breaks git and executable scripts.
-  # The login volumes keep the default: they hold credentials.
+  # Named volumes keep the default: they typically hold credentials/state.
   msb create --name "$NAME" \
-    --cpus "${CPUS:-3}" --max-cpus "${MAX_CPUS:-4}" \
-    --memory "${MEMORY:-4G}" --max-memory "${MAX_MEMORY:-8G}" \
-    --root-disk "flat:${DISK:-30G}" \
+    --cpus "$cpus" --max-cpus "$max_cpus" \
+    --memory "$memory" --max-memory "$max_memory" \
+    --root-disk "flat:$disk" \
     --mount-dir "$PWD:$WORKDIR:rw,$OWNER,host-perms=mirror" --workdir "$WORKDIR" \
-    --mount-named "$VOL_CLAUDE:$SBX_HOME/.claude:$OWNER" \
-    --mount-named "$VOL_KEYRING:$KEYRING_DIR:$OWNER" \
-    -e "PATH=$SBX_HOME/.local/bin:$SBX_HOME/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    ${vol_flags[@]+"${vol_flags[@]}"} \
+    -e "PATH=$SBX_HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     -e DEBIAN_FRONTEND=noninteractive \
-    -e CLAUDE_CONFIG_DIR="$SBX_HOME/.claude" \
-    -e KEYRING_DIR="$KEYRING_DIR" \
     -e WORKDIR="$WORKDIR" \
     -e SBX_USER="$SBX_USER" -e SBX_UID="$SBX_UID" -e SBX_GID="$SBX_GID" -e SBX_HOME="$SBX_HOME" \
-    -e XDG_RUNTIME_DIR="/run/user/$SBX_UID" \
-    -e DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$SBX_UID/bus" \
     ${port_flags[@]+"${port_flags[@]}"} \
     ${msb_args[@]+"${msb_args[@]}"} \
-    debian:trixie-slim
+    "$image"
 
-  if [ ${#port_flags[@]} -gt 0 ] && ! is_loopback "$HOST_BIND"; then
-    echo "Warning: ports are bound to $HOST_BIND and reachable from other machines on your network:" \
-      "$(printf '%s ' "${port_flags[@]}" | sed 's/-p //g')" >&2
+  if [ ${#exposed[@]} -gt 0 ]; then
+    echo "Warning: ports reachable from other machines on your network: ${exposed[*]}" >&2
   fi
 }
 
-# Bring the sandbox to a usable state: create or start it, provision once, start services.
+# Bring the sandbox to a usable state: create or start it, provision once.
+PROVISIONED_NOW=
 up() {
   if ! exists; then
     create
   else
-    local ips ip exposed=
-    ips="$(bound_ips)"
-    for ip in $ips; do is_loopback "$ip" || exposed+="$ip "; done
-    if [ -n "$HOST_SET" ] && [ -n "$ips" ] && [ "$ips" != "$HOST_BIND" ]; then
-      echo "Note: $NAME already exists with ports bound to $(echo $ips); --host only applies at creation." \
-        "Run 'sbxag destroy' to re-create it bound to $HOST_BIND." >&2
-    elif [ -z "$HOST_SET" ] && [ -n "$exposed" ]; then
-      echo "Note: $NAME's ports are bound to ${exposed% } and reachable from your network." \
-        "To restrict them to localhost: sbxag destroy, then sbxag." >&2
-    fi
     running || msb start "$NAME"
   fi
   local state
@@ -200,50 +205,51 @@ up() {
     'if [ ! -f /opt/.provisioned ]; then echo new; elif id -u "$SBX_USER" >/dev/null 2>&1; then echo ok; else echo old; fi')"
   case "$state" in
     new)
-      echo "First run: installing agents and project tools (a few minutes)..."
-      msb exec --no-stdin "$NAME" -- bash -c "$PROVISION" ;;
+      echo "First run: provisioning sandbox..."
+      msb exec --no-stdin "$NAME" -- bash -c "$PROVISION"
+      PROVISIONED_NOW=1 ;;
     old)
       echo "$NAME was created by an older sbxag that runs everything as root." \
-        "Run 'sbxag destroy' and start again; your agent logins are kept (they're in shared volumes)." >&2
+        "Run 'sbxag destroy' and start again." >&2
       exit 1 ;;
   esac
-  msb exec --no-stdin -q "$NAME" -- bash -c "$SERVICES_ROOT"
-  msb exec --no-stdin -q "${AS_USER[@]}" "$NAME" -- bash -c "$SERVICES_USER"
 }
 
 usage() {
   cat <<'EOF'
-sbxag — one microsandbox microVM per project, with AI coding agents inside.
+sbxag — one microsandbox microVM per project.
 
 Usage (from the project root):
-  sbxag [--host [IP]] [COMMAND]
   sbxag                 open a shell in the project's sandbox (as you; sudo works)
-  sbxag agy [ARGS]      run Antigravity CLI
-  sbxag claude [ARGS]   run Claude Code
   sbxag setup           re-run .sbxag/setup.sh, then .sbxag/setup-user.sh
-  sbxag stop            stop the sandbox (keeps tools, data and logins)
-  sbxag destroy         remove the project's sandbox (logins are kept, they're shared)
+  sbxag stop            stop the sandbox (keeps tools, data and volumes)
+  sbxag destroy         remove the project's sandbox (named volumes are kept)
   sbxag update          update sbxag itself to the latest version
   sbxag -h, --help      show this help
 
-Options:
-  --host [IP]           bind forwarded ports to IP instead of 127.0.0.1, like vite's --host;
-                        without IP, 0.0.0.0 (reachable from other machines on your network).
-                        Applies when the sandbox is created.
-
 Per-project config (optional), in .sbxag/:
-  setup.sh   runs as root in the VM on first run; install the toolchain here, system-wide
-             (e.g. /usr/local) so the guest user can run it
+  config.yml     settings applied at creation (after editing, run `sbxag destroy`):
+                   cpus: 3
+                   max_cpus: 4
+                   memory: 4G
+                   max_memory: 8G
+                   disk: 30G
+                   image: debian:trixie-slim
+                   volumes:
+                     - sbxag-claude:.claude
+                     - sbxag-agy:.gemini
+                     - sbxag-keyring:.local/share/keyrings
+                   ports:
+                     - 3000
+                     - 8080:80
+                     - 0.0.0.0:5173
+  setup.sh       runs as root in the VM on first run; install system packages, daemons, and
+                 system-wide toolchains (e.g. /usr/local)
   setup-user.sh  runs as you right after setup.sh, in the project dir; for things that
-             belong in $HOME (dotfiles, rustup/nvm/uv, project dependencies)
-  ports      one port per line ("3000" or "8080:80"), forwarded to localhost (see --host).
-             Fixed at creation: after editing, run `sbxag destroy` and start again.
+                 belong in $HOME (coding agents, dotfiles, rustup/nvm/uv, project deps)
 
-Agent logins live in shared volumes (sbxag-claude, sbxag-keyring): sign in once per agent,
-every project's sandbox uses it. Reset with: msb volume rm sbxag-claude sbxag-keyring
-
-Environment overrides:
-  NAME=sbxag-<dir>  CPUS=3  MAX_CPUS=4  MEMORY=4G  MAX_MEMORY=8G  DISK=30G
+Environment overrides (take precedence over .sbxag/config.yml):
+  NAME=sbxag-<dir>  CPUS  MAX_CPUS  MEMORY  MAX_MEMORY  DISK  IMAGE  PORTS  VOLUMES
   MSB_ARGS="..."    extra arguments passed to msb create (e.g. MSB_ARGS="--net public,private")
 EOF
 }
@@ -264,24 +270,7 @@ self_update() {
   echo "Updated $self"
 }
 
-# Leading options (anything after the command is passed through to the agent).
-HOST_BIND=127.0.0.1 HOST_SET=
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --host=*) HOST_BIND="${1#--host=}"; HOST_SET=1; shift ;;
-    --host)
-      HOST_SET=1; shift
-      if [[ "${1:-}" =~ ^[0-9.]+$ ]]; then HOST_BIND="$1"; shift; else HOST_BIND=0.0.0.0; fi ;;
-    *) break ;;
-  esac
-done
-valid_ipv4 "$HOST_BIND" || { echo "--host: not a valid IPv4 address: $HOST_BIND" >&2; exit 1; }
-
 cmd="${1:-}"; [ $# -gt 0 ] && shift
-case "$cmd" in
-  stop|destroy|update)
-    [ -n "$HOST_SET" ] && { echo "--host has no effect with '$cmd'; it applies when a sandbox is created." >&2; exit 1; } ;;
-esac
 case "$cmd" in
   -h|--help) usage; exit 0 ;;
   update) self_update; exit 0 ;;
@@ -293,9 +282,9 @@ case "$cmd" in
     [ -f "$CFG/setup.sh" ] || [ -f "$CFG/setup-user.sh" ] \
       || { echo "No .sbxag/setup.sh or .sbxag/setup-user.sh in this project." >&2; exit 1; }
     up
+    [ -n "$PROVISIONED_NOW" ] && exit 0
     if [ -f "$CFG/setup.sh" ]; then
       msb exec -t "$NAME" -- bash -e "$WORKDIR/.sbxag/setup.sh"
-      msb exec --no-stdin -q "$NAME" -- bash -c "$SERVICES_ROOT"   # e.g. start Docker if setup just installed it
     fi
     if [ -f "$CFG/setup-user.sh" ]; then
       msb exec -t "${AS_USER[@]}" "$NAME" -- bash -e "$WORKDIR/.sbxag/setup-user.sh"
@@ -304,13 +293,5 @@ case "$cmd" in
   "")
     up
     exec msb exec -t "${AS_USER[@]}" "$NAME" -- bash ;;
-  agy)
-    up
-    # SSH_* vars make agy use its "open this URL, paste the code" sign-in instead of a browser.
-    exec msb exec -t "${AS_USER[@]}" -e "SSH_CONNECTION=127.0.0.1 22 127.0.0.1 22" -e "SSH_CLIENT=127.0.0.1 22 22" \
-      "$NAME" -- agy "$@" ;;
-  claude)
-    up
-    exec msb exec -t "${AS_USER[@]}" "$NAME" -- claude "$@" ;;
   *) usage >&2; exit 1 ;;
 esac
