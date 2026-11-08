@@ -6,7 +6,7 @@
 # memory: 4G
 # max_memory: 8G
 # disk: 30G
-# image: debian:trixie-slim
+# image: debian:trixie-slim   # or mcr.microsoft.com/devcontainers/base:trixie (has sudo, ca-certificates, curl, git pre-installed)
 
 # Shared named volumes ("volume:guest_path"; relative paths are inside $HOME).
 volumes:

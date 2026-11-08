@@ -40,8 +40,10 @@ AS_USER=(--user "$SBX_USER" -e "HOME=$SBX_HOME" -e "USER=$SBX_USER" -e "LOGNAME=
 # Provisioning: runs once per project sandbox, as root, the first time it is created.
 PROVISION='
 set -e
-apt-get update
-apt-get install -y --no-install-recommends sudo ca-certificates
+if ! command -v sudo >/dev/null || [ ! -f /etc/ssl/certs/ca-certificates.crt ]; then
+  apt-get update
+  apt-get install -y --no-install-recommends sudo ca-certificates
+fi
 echo "=== creating user $SBX_USER ($SBX_UID:$SBX_GID) ==="
 if ! id -u "$SBX_USER" >/dev/null 2>&1; then
   getent group "$SBX_GID" >/dev/null || groupadd -g "$SBX_GID" "$SBX_USER"
@@ -201,6 +203,7 @@ create() {
   # host-perms=mirror: modes set in the guest (new files, chmod +x) reach the host files too;
   # by default they stay inside the sandbox, which breaks git and executable scripts.
   # Named volumes keep the default: they typically hold credentials/state.
+  echo "=== creating sandbox $NAME ($image) ==="
   msb create --name "$NAME" \
     --cpus "$cpus" --max-cpus "$max_cpus" \
     --memory "$memory" --max-memory "$max_memory" \
@@ -234,8 +237,9 @@ up() {
     'if [ ! -f /opt/.provisioned ]; then echo new; elif id -u "$SBX_USER" >/dev/null 2>&1; then echo ok; else echo old; fi')"
   case "$state" in
     new)
-      echo "First run: provisioning sandbox..."
-      msb exec --no-stdin "$NAME" -- bash -c "$PROVISION"
+      echo "=== first run: provisioning sandbox ==="
+      local tty_flag=(--no-stdin); [ -t 0 ] && tty_flag=(-t)
+      msb exec "${tty_flag[@]}" "$NAME" -- bash -c "$PROVISION"
       PROVISIONED_NOW=1 ;;
     old)
       echo "$NAME was created by an older sbxag that runs everything as root." \
@@ -263,7 +267,7 @@ Per-project config (optional), in .sbxag/:
                    memory: 4G
                    max_memory: 8G
                    disk: 30G
-                   image: debian:trixie-slim
+                   image: debian:trixie-slim   # or mcr.microsoft.com/devcontainers/base:trixie for faster first boot
                    volumes:
                      - sbxag-claude:.claude
                      - sbxag-agy:.gemini
