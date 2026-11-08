@@ -271,7 +271,6 @@ Per-project config (optional), in .sbxag/:
                    volumes:
                      - sbxag-claude:.claude
                      - sbxag-agy:.gemini
-                     - sbxag-keyring:.local/share/keyrings
                    mounts:
                      - ~/.gitconfig:.gitconfig:ro
                    ports:

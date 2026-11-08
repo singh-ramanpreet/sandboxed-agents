@@ -1,11 +1,10 @@
 # Runs as root inside the sandbox on first boot (Debian 13). Re-run with: sbxag setup
 # Install tools system-wide (e.g. /usr/local): shells run as your user, not root.
-# Example: base tools, keyring for agy, Docker, Bun, and Supabase CLI.
+# Example: base tools, Docker, Bun, and Supabase CLI.
 
 apt-get update
 apt-get install -y --no-install-recommends \
-  curl git unzip procps openssl \
-  dbus dbus-x11 gnome-keyring \
+  curl git unzip procps \
   docker.io docker-cli iptables
 
 # Helper to start dockerd (called now and from ~/.bashrc after `sbxag stop` -> `sbxag`).
