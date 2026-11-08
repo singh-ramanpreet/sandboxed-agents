@@ -1,0 +1,4 @@
+volumes:
+  - sbxag-claude:.claude
+  - sbxag-agy:.gemini
+  - sbxag-keyring:.local/share/keyrings
