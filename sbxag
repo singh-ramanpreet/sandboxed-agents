@@ -6,7 +6,7 @@
 #
 # Per project (optional), in <project>/.sbxag/:
 #   config.yml     settings applied when the sandbox is created (cpus, max_cpus, memory,
-#                  max_memory, disk, image, ports, volumes).
+#                  max_memory, disk, image, ports, volumes, mounts).
 #                  After changing config.yml, run `sbxag destroy` and start again.
 #   setup.sh       runs as root INSIDE the VM on first run — install system packages,
 #                  daemons (e.g. Docker), and system-wide toolchains (/usr/local).
@@ -48,8 +48,8 @@ if ! id -u "$SBX_USER" >/dev/null 2>&1; then
   useradd -o -M -d "$SBX_HOME" -u "$SBX_UID" -g "$SBX_GID" -s /bin/bash "$SBX_USER"
 fi
 mkdir -p "$SBX_HOME"
-cp -r /etc/skel/. "$SBX_HOME"/
-chown -R "$SBX_UID:$SBX_GID" "$SBX_HOME"
+cp -rn /etc/skel/. "$SBX_HOME"/
+find "$SBX_HOME" -xdev ! -exec mountpoint -q {} \; -exec chown "$SBX_UID:$SBX_GID" {} +
 echo "$SBX_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/sbxag && chmod 0440 /etc/sudoers.d/sbxag
 as_user() { runuser -u "$SBX_USER" -- env HOME="$SBX_HOME" USER="$SBX_USER" LOGNAME="$SBX_USER" "$@"; }
 if [ -f "$WORKDIR/.sbxag/setup.sh" ]; then
@@ -78,7 +78,7 @@ running() { msb ls -q --running | grep -Fxq "$NAME"; }
 load_config() {
   local line k v list_key=
   cfg_cpus= cfg_max_cpus= cfg_memory= cfg_max_memory= cfg_disk= cfg_image=
-  cfg_ports= cfg_volumes=
+  cfg_ports= cfg_volumes= cfg_mounts=
   [ -f "$CFG/config.yml" ] || return 0
   while IFS= read -r line || [ -n "$line" ]; do
     line="${line%%#*}"
@@ -90,6 +90,7 @@ load_config() {
       case "$list_key" in
         ports)   cfg_ports+="$v " ;;
         volumes) cfg_volumes+="$v " ;;
+        mounts)  cfg_mounts+="$v " ;;
         *) echo "Unexpected list item in .sbxag/config.yml: $line" >&2; exit 1 ;;
       esac
       continue
@@ -113,6 +114,9 @@ load_config() {
       volumes)
         if [ -z "$v" ]; then list_key=volumes
         else v="${v#\[}"; v="${v%\]}"; cfg_volumes+="${v//,/ } "; fi ;;
+      mounts)
+        if [ -z "$v" ]; then list_key=mounts
+        else v="${v#\[}"; v="${v%\]}"; cfg_mounts+="${v//,/ } "; fi ;;
       *) echo "Unknown key in .sbxag/config.yml: $k" >&2; exit 1 ;;
     esac
   done < "$CFG/config.yml"
@@ -128,6 +132,7 @@ create() {
   local image="${IMAGE:-${cfg_image:-debian:trixie-slim}}"
   local ports_raw="${PORTS:-${cfg_ports:-}}"
   local volumes_raw="${VOLUMES:-${cfg_volumes:-}}"
+  local mounts_raw="${MOUNTS:-${cfg_mounts:-}}"
 
   [[ "$cpus" =~ ^[0-9]+$ ]]            || { echo "Invalid cpus: $cpus" >&2; exit 1; }
   [[ "$max_cpus" =~ ^[0-9]+$ ]]        || { echo "Invalid max_cpus: $max_cpus" >&2; exit 1; }
@@ -164,6 +169,29 @@ create() {
     vol_flags+=(--mount-named "$vol_name:$guest_path:$OWNER")
   done
 
+  local mount_flags=() mounts_list=() m host_path mode
+  read -ra mounts_list <<< "$mounts_raw"
+  for m in ${mounts_list[@]+"${mounts_list[@]}"}; do
+    if [[ ! "$m" =~ ^([^:,]+):([^:,]+)(:(ro|rw))?$ ]]; then
+      echo "Invalid mount in mounts (expected host_path:guest_path[:ro|rw]): $m" >&2; exit 1
+    fi
+    host_path="${BASH_REMATCH[1]}" guest_path="${BASH_REMATCH[2]}" mode="${BASH_REMATCH[4]:-rw}"
+    [[ "$host_path" == "~/"* ]] && host_path="$HOME/${host_path#\~/}"
+    [[ "$host_path" == /* ]] || host_path="$PWD/${host_path#./}"
+    [[ "$guest_path" == "~/"* ]] && guest_path="${guest_path#\~/}"
+    [[ "$guest_path" == /* ]] || guest_path="$SBX_HOME/$guest_path"
+    if [[ ! "$guest_path" =~ ^/[a-zA-Z0-9_./-]+$ ]] || [[ "$guest_path" == *..* ]]; then
+      echo "Invalid guest path in mounts: $m" >&2; exit 1
+    fi
+    if [ -f "$host_path" ]; then
+      mount_flags+=(--mount-file "$host_path:$guest_path:$mode,$OWNER")
+    elif [ -d "$host_path" ]; then
+      mount_flags+=(--mount-dir "$host_path:$guest_path:$mode,$OWNER")
+    else
+      echo "Mount source not found (expected file or directory): $host_path" >&2; exit 1
+    fi
+  done
+
   # Optional extra flags passed to msb create from the host environment (e.g. MSB_ARGS="--net public,private")
   local msb_args=()
   if [ -n "${MSB_ARGS:-}" ]; then
@@ -179,6 +207,7 @@ create() {
     --root-disk "flat:$disk" \
     --mount-dir "$PWD:$WORKDIR:rw,$OWNER,host-perms=mirror" --workdir "$WORKDIR" \
     ${vol_flags[@]+"${vol_flags[@]}"} \
+    ${mount_flags[@]+"${mount_flags[@]}"} \
     -e "PATH=$SBX_HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     -e DEBIAN_FRONTEND=noninteractive \
     -e WORKDIR="$WORKDIR" \
@@ -239,6 +268,8 @@ Per-project config (optional), in .sbxag/:
                      - sbxag-claude:.claude
                      - sbxag-agy:.gemini
                      - sbxag-keyring:.local/share/keyrings
+                   mounts:
+                     - ~/.gitconfig:.gitconfig:ro
                    ports:
                      - 3000
                      - 8080:80
@@ -249,7 +280,7 @@ Per-project config (optional), in .sbxag/:
                  belong in $HOME (coding agents, dotfiles, rustup/nvm/uv, project deps)
 
 Environment overrides (take precedence over .sbxag/config.yml):
-  NAME=sbxag-<dir>  CPUS  MAX_CPUS  MEMORY  MAX_MEMORY  DISK  IMAGE  PORTS  VOLUMES
+  NAME=sbxag-<dir>  CPUS  MAX_CPUS  MEMORY  MAX_MEMORY  DISK  IMAGE  PORTS  VOLUMES  MOUNTS
   MSB_ARGS="..."    extra arguments passed to msb create (e.g. MSB_ARGS="--net public,private")
 EOF
 }
